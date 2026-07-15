@@ -1,0 +1,144 @@
+---
+title: "Post-processing & summarizing the outputs from the Habitat Risk Assessment (HRA) model using the habitat maps from 2016 - Scenario 2016"
+authors: "Jade Delevaux and Jesse A. Goldstein"
+created: July 2026
+output:
+  html_document:
+  df_print: paged
+---
+
+To run this script, install the packages below
+
+```{r Install packages needed for this script}
+library(sf)
+library(foreign)
+library(raster)
+library(dplyr)
+library(exactextractr)
+library(ggplot2)
+library(gridExtra)
+library(cowplot)
+library(sp)
+library(ggpubr)
+library(tigris)
+library(reshape)
+```
+
+Note: The working directory needs to reflect your local machine. Set the single root path below to point at your local copy of the "Science" folder; every input and output path in this script is built from it, so there is only one line to change.
+
+```{r Set the root working directory and shared parameters}
+# Root of the working directory: change this one line to match your local machine
+wd_root <- "G:/Shared drives/GreenFin Belize/Science"
+
+# Folder holding the reclassified HRA risk rasters (inputs from the model)
+hra_outputs_dir <- file.path(wd_root, "01_hra_model/5_hra_outputs/2016_habitats/2016/outputs")
+
+# Folder where the split rasters and risk summaries will be written (outputs)
+summary_dir <- file.path(wd_root, "01_hra_model/5_hra_outputs/2016_habitats/2016")
+
+# Folder holding the CPU habitat shapefiles (inputs)
+base_dir <- file.path(wd_root, "01_hra_model/_base")
+
+# The three habitats processed identically in this script
+habitats <- c("corals", "seagrass", "mangroves")
+
+# Risk classes: the label used in filenames/columns mapped to its raster value.
+# HRA classifies risk as none (0), low (1), medium (2), high (3).
+risk_classes <- c(non = 0, low = 1, med = 2, hig = 3)
+
+# Conversion factor applied to summed grid cells:
+#   1) each HRA cell is 500 m x 500 m = 250,000 m2, and
+#   2) we convert m2 to km2,
+# which together give a factor of 0.25.
+cell_area_km2 <- 0.25
+```
+
+# A/ 2016 Habitat maps & 2016 Human stressors:
+
+HRA outputs a risk raster map for each habitat (corals, seagrass, and mangroves), which classifies the level of risk as: no risk (0), low risk (1), medium risk (2), and high risk (3). To quantify the area (km2) of habitat under each risk level, we need to split the raster per risk level (none, low, medium, high) for each habitat type.
+
+The loop below reproduces, for every habitat, the same operation: read the reclassified risk raster, create one binary integer raster per risk class, plot it, and write it to disk.
+
+```{r Split each habitat risk map into separate rasters per risk class}
+# Iterate over each habitat (corals, seagrass, mangroves)
+for (habitat in habitats) {
+  
+  # Read the reclassified HRA risk raster for this habitat
+  reclass_risk <- raster(file.path(hra_outputs_dir,
+                                   paste0("RECLASS_RISK_", habitat, ".tif")))
+  
+  # Iterate over each risk class (none, low, med, hig) and its raster value
+  for (risk_label in names(risk_classes)) {
+    risk_value <- risk_classes[[risk_label]]
+    
+    # Binary raster: cells equal to this risk value become 1, all others 0
+    risk_layer <- reclass_risk == risk_value
+    
+    # Visual check for this habitat/risk-class combination
+    plot(risk_layer, main = paste(habitat, risk_label))
+    
+    # Write the binary risk raster (e.g. risk_low_corals.tif)
+    writeRaster(risk_layer,
+                filename = file.path(summary_dir,
+                                     paste0("risk_", risk_label, "_", habitat, ".tif")),
+                overwrite = TRUE)
+  }
+}
+```
+
+# B/ Habitat 2016 - Stressors 2016: Calculate the habitat area under each risk class per coastal planning unit (CPU)
+
+Note that to calculate the habitat area we need to multiply the raster values by 0.25 because: 1) we sum the grid cells from HRA at 500m x 500m = 250,000 m2 and 2) we want to convert those values to km2. This factor is stored above as `cell_area_km2`.
+
+For each habitat we: import the coral/seagrass/mangrove shapefile subdivided by coastal planning units (CPUs), run zonal statistics to get the area (km2) under each risk class per CPU, convert those areas to a percentage of the CPU area, and export the result as both a shapefile and a CSV. All of this is identical across habitats, so it runs inside a single loop.
+
+```{r Summarize risk area per CPU and export for each habitat}
+# Iterate over each habitat (corals, seagrass, mangroves)
+for (habitat in habitats) {
+
+  # --- Import the habitat shapefile subdivided by CPUs ---
+  habitat_cpu <- st_read(file.path(base_dir,
+                                   paste0("cpu_", habitat, "_2016.shp")))
+
+  # area (km2) under each risk class per CPU
+  # All four km2 columns are added first (grouped: all km2 columns, then all pct columns)
+  for (risk_label in names(risk_classes)) {
+    risk_layer <- raster(file.path(summary_dir,
+                                   paste0("risk_", risk_label, "_", habitat, ".tif")))
+    km2_col <- paste0(risk_label, "_km2")
+    habitat_cpu[[km2_col]] <- exact_extract(risk_layer, habitat_cpu, "sum")
+    habitat_cpu[[km2_col]] <- round(habitat_cpu[[km2_col]] * cell_area_km2, digits = 1)
+  }
+
+  # % of CPU area under each risk class
+  # Added after all km2 columns
+  for (risk_label in names(risk_classes)) {
+    km2_col <- paste0(risk_label, "_km2")
+    pct_col <- paste0(risk_label, "_pct")
+    habitat_cpu[[pct_col]] <- round(habitat_cpu[[km2_col]] / habitat_cpu$cpu_km2 * 100,
+                                    digits = 1)
+  }
+
+  # Export the shapefile and a CSV table
+  habitat_sp <- as(habitat_cpu, "Spatial")
+  print(class(habitat_sp))
+  habitat_sf <- st_as_sf(habitat_sp)
+
+  st_write(habitat_sf,
+           dsn = file.path(summary_dir, paste0("risk_summary_", habitat, ".shp")),
+           driver = "ESRI Shapefile",
+           delete_layer = TRUE)
+
+  habitat_risk_summary <- as.data.frame(habitat_sp)
+  print(names(habitat_risk_summary))
+  write.csv(habitat_risk_summary,
+            file.path(summary_dir, paste0("risk_summary_", habitat, ".csv")),
+            row.names = FALSE)
+}
+```
+
+We completed this section so we can clear our working environment
+
+```{r Clear the working environment}
+rm(list = ls(all.names = TRUE))
+```
