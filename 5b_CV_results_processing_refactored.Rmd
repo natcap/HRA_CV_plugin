@@ -1,0 +1,311 @@
+---
+title: "Post process the Coastal Vulnerability model outputs using the habitat maps from 2016"
+author: "Jade Delevaux and Jesse A. Goldstein"
+created: July 2026
+output:
+  html_document:
+  df_print: paged
+---
+
+To run this script, install the packages below.
+
+```{r Install packages}
+library(sf)
+library(foreign)
+library(raster)
+library(dplyr)
+library(exactextractr)   # quick zonal statistics
+library(ggplot2)
+library(gridExtra)
+library(cowplot)
+library(sp)
+library(ggpubr)
+library(tigris)
+library(matrixStats)
+library(reshape2)
+```
+
+# A/ Quantify habitat importance for coastal protection across all scenarios (2016, 2020, 2025) relative to the 2016 no-habitat exposure index
+
+Assess the role of habitat in coastal protection by comparing the coastal exposure index (EI) from the three timeline scenarios (2016, 2020, 2025) against the exposure index with no habitat, which is defined once from 2016 and used as the fixed baseline for all years. In total this gives four EI series: 2016 no-habitat, 2016 with-habitat, 2020 with-habitat, and 2025 with-habitat.
+
+Reclassify the EI results into four risk classes (low, medium-low, medium-high, high) using quantile breaks computed across all four EI series combined.
+
+Set the parameters for this section.
+
+```{r Set the parameters for the exposure index reclassification}
+wd_root <- "G:/Shared drives/GreenFin Belize/Science"
+cv_dir  <- file.path(wd_root, "02_cv_model/cv_outputs/2016_habitats")
+
+years <- c("2016", "2020", "2025")
+```
+
+Read each year's exposure-index shapefile (the output of the previous script).
+
+```{r Read the exposure index results for each year}
+cv <- list()
+for (y in years) {
+  cv[[y]] <- st_read(file.path(cv_dir, y, "cv_ei_w_hra.shp"))
+}
+```
+
+Gather all exposure-index values into a single vector to determine the quantile breaks. This combines the 2016 no-habitat series with the with-habitat series from all three years.
+
+```{r Compute the quantile breaks across all exposure index values}
+ei <- c(cv[["2016"]]$ei_noh,   # 2016 no-habitat baseline
+        cv[["2016"]]$ei_hra,   # 2016 with-habitat
+        cv[["2020"]]$ei_hra,   # 2020 with-habitat
+        cv[["2025"]]$ei_hra)   # 2025 with-habitat
+
+q <- quantile(ei, prob = c(.25, .5, .75, 1))
+q
+```
+
+Reclassify each exposure index into four risk classes: low (<=25%, coded 1), medium-low (25-50%, coded 2), medium-high (50-75%, coded 3), and high (75-100%, coded 4). The 2016 object is reclassified for both the no-habitat baseline (`eic_noh`) and the with-habitat scenario (`eic_hra`); 2020 and 2025 are reclassified for the with-habitat scenario only, since they share the single 2016 no-habitat baseline.
+
+```{r Reclassify the exposure index into four risk classes}
+# Helper: reclassify a numeric EI vector into 1-4 using the quantile breaks q
+reclass_ei <- function(x) {
+  cls <- rep(NA_integer_, length(x))
+  cls[x <= q[1]] <- 1
+  cls[x > q[1] & x <= q[2]] <- 2
+  cls[x > q[2] & x <= q[3]] <- 3
+  cls[x > q[3] & x <= 5]    <- 4   # max EI is < 5, so 5 is a safe upper bound
+  cls
+}
+
+# 2016: both the no-habitat baseline and the with-habitat scenario
+cv[["2016"]]$eic_noh <- reclass_ei(cv[["2016"]]$ei_noh)
+cv[["2016"]]$eic_hra <- reclass_ei(cv[["2016"]]$ei_hra)
+
+# 2020 and 2025: with-habitat scenario only
+cv[["2020"]]$eic_hra <- reclass_ei(cv[["2020"]]$ei_hra)
+cv[["2025"]]$eic_hra <- reclass_ei(cv[["2025"]]$ei_hra)
+```
+
+Calculate the change in risk class (`risk_dlt`) between each scenario's with-habitat classification and the 2016 no-habitat baseline. A positive value means the shoreline point moves to a lower risk class thanks to habitat. All three years are compared against the same 2016 no-habitat baseline (`eic_noh`). Because the three shapefiles share identical `shore_id` in the same row order, align the 2016 baseline to each year by row (verified 1:1).
+
+```{r Calculate the change in risk class due to habitat}
+eic_noh_2016 <- cv[["2016"]]$eic_noh
+
+cv[["2016"]]$risk_dlt <- eic_noh_2016 - cv[["2016"]]$eic_hra
+cv[["2020"]]$risk_dlt <- eic_noh_2016 - cv[["2020"]]$eic_hra
+cv[["2025"]]$risk_dlt <- eic_noh_2016 - cv[["2025"]]$eic_hra
+```
+
+Export each year's result as a shapefile (geometry preserved) and a CSV (geometry dropped for clean tabular output).
+
+```{r Export the reclassified results as shp and csv}
+for (y in years) {
+  st_write(cv[[y]],
+           dsn = file.path(cv_dir, y, paste0("cv_", y, "_ei_reclass.shp")),
+           driver = "ESRI Shapefile", delete_layer = TRUE)
+  
+  write.csv(st_drop_geometry(cv[[y]]),
+            file.path(cv_dir, y, paste0("cv_", y, "_ei_reclass.csv")),
+            row.names = FALSE)
+}
+```
+
+# B/ Summarize the km of shoreline and number of people benefiting from habitat protection, by CPU
+
+Summarize the results two ways: (B.1) how many km of shoreline and how many people become less exposed to any level of coastal risk thanks to habitat, and (B.2) how many become no longer at high risk. Both are summarized per CPU across the three scenarios.
+
+## B.1/ Change in risk exposure class due to habitat
+
+Count the number of shoreline points within each CPU to compute shoreline kms that become less exposed to coastal hazard due to the presence of habitats. For each year, read the reclassified shoreline points, keep those whose risk class improved due to habitat (`risk_dlt` of 1, 2, or 3), and extract the number of people at each point from that year's population raster. Because there is no 2025 population raster, the 2025 scenario uses the 2020 population (the most recent available).
+
+We set the parameters for this section.
+
+```{r Set the parameters for the risk-delta summary}
+wd_root <- "G:/Shared drives/GreenFin Belize/Science"
+cv_dir  <- file.path(wd_root, "02_cv_model/cv_outputs/2016_habitats")
+ppp_dir <- file.path(wd_root, "02_cv_model/cv_inputs")
+
+# Each year's population raster (2025 uses 2020)
+ppp_files <- c("2016" = "bz_ppp_2016_2km_mean.tif",
+               "2020" = "bz_ppp_2020_2km_mean.tif",
+               "2025" = "bz_ppp_2020_2km_mean.tif")
+
+# Risk-delta values that indicate an improvement in risk class due to habitat
+improved <- c(1, 2, 3)
+```
+
+For each year, count km of shoreline and sum people that became less exposed, per CPU, then combine the three years.
+
+```{r Compute km and people less exposed due to habitat, per CPU}
+delta_by_cpu <- list()
+
+for (y in c("2016", "2020", "2025")) {
+
+  # Read the reclassified points; keep shore_id, cpu, risk_dlt
+  pts <- st_read(file.path(cv_dir, y, paste0("cv_", y, "_ei_reclass.shp")))
+  pts <- pts[, c("shore_id", "cpu", "risk_dlt")]
+
+  # Keep only points whose risk class improved due to habitat
+  pts <- pts[pts$risk_dlt %in% improved, ]
+
+  # Extract people per point from the year's population raster and scale by 25
+  ppl_raster <- raster(file.path(ppp_dir, ppp_files[[y]]))
+  NAvalue(ppl_raster) <- -9999
+  pts$ppl <- raster::extract(ppl_raster, pts, method = "simple") * 25
+
+  # Write the per-point delta shapefile
+  st_write(pts,
+           dsn = file.path(cv_dir, y, paste0("cv_", y, "_ei_reclass_delta_w_people.shp")),
+           driver = "ESRI Shapefile", delete_layer = TRUE)
+
+  # Summarize per CPU: km of shoreline (points/4) and total people
+  df <- st_drop_geometry(pts)
+  km  <- aggregate(shore_id ~ cpu, data = df, FUN = length)
+  km$km <- km$shore_id / 4
+  ppl <- aggregate(ppl ~ cpu, data = df, FUN = sum)
+  ppl$ppl <- as.integer(ppl$ppl)
+
+  summary_cpu <- merge(km[, c("cpu", "shore_id", "km")],
+                       ppl[, c("cpu", "ppl")], by = "cpu")
+  summary_cpu$year <- y
+  delta_by_cpu[[y]] <- summary_cpu
+}
+
+cv_risk_delta_by_cpu <- do.call(rbind, delta_by_cpu)
+
+write.csv(cv_risk_delta_by_cpu,
+          file.path(cv_dir, "cv_ei_delta_km_ppl_by_cpu.csv"),
+          row.names = FALSE)
+```
+
+## B.2/ Change in high risk exposure due to habitat
+
+Count the number of shoreline points within each CPU to compute the number of shoreline kms that becomes not at high risk due to the presence of habitats.
+
+We're also interested in determining which section of the shoreline becomes less at High risk due to habitat. A point qualifies if it was at high risk under the 2016 no-habitat baseline (`eic_noh` = 4) and its risk class improved due to habitat (`risk_dlt` of 1, 2, or 3). Compare the EI to the scenario No habitat High EI from 2016. As in section A, this 2016 no-habitat classification is the single baseline for all years; join it to each year's points by `shore_id` (shoreline points are identical across years).
+
+Reuse the parameters set in B.1 (`cv_dir`, `ppp_dir`, `ppp_files`, `improved`).
+
+Extract the 2016 no-habitat high-risk baseline, keyed by shoreline point.
+
+```{r Extract the 2016 no-habitat high-risk baseline}
+s16 <- st_read(file.path(cv_dir, "2016", "cv_2016_ei_reclass.shp"))
+eic_noh_baseline <- st_drop_geometry(s16)[, c("shore_id", "eic_noh")]
+```
+
+For each year, read the reclassified points, join the 2016 no-habitat baseline by `shore_id`, keep points that were at high risk under that baseline and whose risk class improved, extract people, then summarize per CPU and combine.
+
+```{r Compute km and people no longer at high risk due to habitat, per CPU}
+high_delta_by_cpu <- list()
+
+for (y in c("2016", "2020", "2025")) {
+
+  pts <- st_read(file.path(cv_dir, y, paste0("cv_", y, "_ei_reclass.shp")))
+  pts <- pts[, c("shore_id", "cpu", "risk_dlt")]
+
+  # Join the 2016 no-habitat high-risk baseline by shore_id
+  pts <- merge(pts, eic_noh_baseline, by = "shore_id", all.x = TRUE)
+
+  # Flag points at high risk (class 4) under the 2016 no-habitat baseline
+  pts$eic_hig <- ifelse(pts$eic_noh == 4, 1, 0)
+
+  # Keep points that were high-risk (eic_hig == 1) AND improved due to habitat
+  pts <- pts[pts$eic_hig == 1 & pts$risk_dlt %in% improved, ]
+
+  # Extract people per point; scale by 25 (0.25 km point, 2 km mean raster)
+  ppl_raster <- raster(file.path(ppp_dir, ppp_files[[y]]))
+  NAvalue(ppl_raster) <- -9999
+  pts$ppl <- raster::extract(ppl_raster, pts, method = "simple") * 25
+
+  # Write the per-point high-risk delta shapefile
+  st_write(pts,
+           dsn = file.path(cv_dir, y, paste0("cv_", y, "_ei_reclass_delta_high_w_people.shp")),
+           driver = "ESRI Shapefile", delete_layer = TRUE)
+
+  # Summarize per CPU: km of shoreline (points / 4) and total people
+  df <- st_drop_geometry(pts)
+  km  <- aggregate(shore_id ~ cpu, data = df, FUN = length)
+  km$km <- km$shore_id / 4
+  ppl <- aggregate(ppl ~ cpu, data = df, FUN = sum)
+  ppl$ppl <- as.integer(ppl$ppl)
+
+  summary_cpu <- merge(km[, c("cpu", "shore_id", "km")],
+                       ppl[, c("cpu", "ppl")], by = "cpu")
+  summary_cpu$year <- y
+  high_delta_by_cpu[[y]] <- summary_cpu
+}
+
+cv_risk_delta_high_by_cpu <- do.call(rbind, high_delta_by_cpu)
+
+write.csv(cv_risk_delta_high_by_cpu,
+          file.path(cv_dir, "cv_ei_delta_high_km_ppl_by_cpu.csv"),
+          row.names = FALSE)
+```
+
+# C/ Summarize the results into bar charts
+
+Create bar charts showing the coastal risk reduction due to habitat, by CPU: shoreline km and number of people, for both the change in any risk class and the change out of high risk. This gives four charts, differing only in the input summary, the value plotted, the titles, and the output file.
+
+Set the parameters for the charts.
+
+```{r Set the parameters for the CV summary bar charts}
+wd_root <- "G:/Shared drives/GreenFin Belize/Science"
+cv_dir  <- file.path(wd_root, "02_cv_model/cv_outputs/2016_habitats")
+
+# Colors for the three scenario years
+year_cols <- c("2016" = "deepskyblue", "2020" = "darkorchid", "2025" = "deeppink")
+
+# CPU factor order (reversed, so unit 1 appears at the top after coord_flip)
+cpu_levels <- c("9-Southern Region", "8-South Central Region", "7-South Northern Region",
+                "6-Lighthouse Reef Atoll", "5-Turneffe Atoll", "4-Central Region",
+                "3-Caye Caulker", "2-Ambergris Caye", "1-Northern Region")
+
+# The four charts: input summary CSV, value to plot, title, axis label, output PDF
+cv_charts <- list(
+  list(csv = "cv_ei_delta_km_ppl_by_cpu.csv",      value = "km",  title = "Shoreline Protected by Habitat",
+       ylab = "Shoreline at Lesser Risk (km)",     pdf = "_barplot_cpu_shoreline_risk_mitigated_by_habitat_km.pdf"),
+  list(csv = "cv_ei_delta_km_ppl_by_cpu.csv",      value = "ppl", title = "People Protected by Habitat",
+       ylab = "People at Lesser Risk (#)",         pdf = "_barplot_cpu_shoreline_risk_mitigated_by_habitat_ppl.pdf"),
+  list(csv = "cv_ei_delta_high_km_ppl_by_cpu.csv", value = "km",  title = "Shoreline Protected by Habitat",
+       ylab = "Shoreline at Lesser Risk (km)",     pdf = "_barplot_cpu_shoreline_high_risk_mitigated_by_habitat_km.pdf"),
+  list(csv = "cv_ei_delta_high_km_ppl_by_cpu.csv", value = "ppl", title = "People Protected by Habitat",
+       ylab = "People at Lesser Risk (#)",         pdf = "_barplot_cpu_shoreline_high_risk_mitigated_by_habitat_ppl.pdf")
+)
+```
+
+Read the CPU name lookup once, then loop over the four charts, joining the CPU labels by CPU, ordering the factors, and writing each chart to its own PDF.
+
+```{r Draw the four CV summary bar charts}
+cpu_names <- read.csv(file.path(cv_dir, "cpu_name.csv"))
+
+for (chart in cv_charts) {
+  cv_outputs <- read.csv(file.path(cv_dir, chart$csv))
+
+  # Join the CPU labels by CPU (robust to row order), then keep the plotting columns
+  cv_outputs <- merge(cv_outputs, cpu_names[, c("cpu", "cpuwname")], by = "cpu")
+
+  # A single facet label
+  cv_outputs$CV_model <- factor("Coastal Risk Exposure", levels = "Coastal Risk Exposure")
+
+  # Order the year and CPU factors
+  cv_outputs$year     <- factor(cv_outputs$year, levels = c("2025", "2020", "2016"))
+  cv_outputs$cpuwname <- factor(cv_outputs$cpuwname, levels = cpu_levels)
+
+  ggbars <- ggplot(cv_outputs) +
+    geom_bar(aes(x = cpuwname, y = .data[[chart$value]], fill = year),
+             position = "dodge", stat = "identity") +
+    scale_fill_manual(values = year_cols) +
+    labs(title = chart$title, x = "Coastal Planning Units", y = chart$ylab) +
+    facet_wrap("CV_model") +
+    theme_bw() +
+    theme(axis.title.x = element_text(size = 12, face = "bold"),
+          axis.title.y = element_text(size = 12, face = "bold"),
+          axis.text.x  = element_text(angle = 45, hjust = 0.7, vjust = 0.8),
+          axis.text    = element_text(size = 12, color = "black"),
+          strip.text.x = element_text(size = 12),
+          legend.title = element_text(color = "black", size = 12, face = "bold"),
+          legend.text  = element_text(color = "black", size = 12),
+          legend.position = "bottom")
+
+  pdf(file.path(cv_dir, chart$pdf), width = 5, height = 5)
+  print(plot_grid(ggbars + coord_flip() + scale_y_continuous(labels = scales::comma)))
+  dev.off()
+}
+```
