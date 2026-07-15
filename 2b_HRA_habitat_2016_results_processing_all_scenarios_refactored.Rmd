@@ -1,0 +1,556 @@
+---
+title: "Post-processing & summarizing the outputs from the Habitat Risk Assessment (HRA) model using the habitat maps from 2016 and all the scenarios"
+author: "Jade Delevaux and Jesse A. Goldstein"
+created: July 2026
+output:
+  html_document:
+  df_print: paged
+---
+
+To run this script, install the packages below.
+
+```{r Install packages needed for this script}
+library(sf)
+library(foreign)
+library(raster)
+library(dplyr)
+library(exactextractr)
+library(ggplot2)
+library(gridExtra)
+library(cowplot)
+library(sp)
+library(ggpubr)
+library(tigris)
+library(reshape)
+library(scales)
+```
+
+Note: The working directory (WD) needs to reflect your local machine. Change the root path in the parameter chunk below to point at your local copy of the "Science" folder; every input and output path in this script is built from it.
+
+```{r Set the root working directory and shared parameters}
+# Root of the working directory: change this one line to match your local machine
+wd_root <- "G:/Shared drives/GreenFin Belize/Science"
+
+# Folder holding the per-year risk summary CSVs (inputs) and where the combined
+# by-scenario summaries will be written (outputs).
+habitats_dir <- file.path(wd_root, "01_hra_model/5_hra_outputs/2016_habitats")
+
+habitats <- c("corals", "seagrass", "mangroves")
+years    <- c("2016", "2020", "2025")
+
+# Column blocks kept for each unit
+units <- list(
+  km2 = c(1:9),
+  pct = c(1:5, 10:13)
+)
+
+# Identifier columns held fixed during melt. cpu_km2 is intentionally NOT included, so it # is melted as its own Risk row in the output.
+id_cols <- c("cpu", "cpu_name", "cpu_nameo", "habitat", "Year")
+
+# Labels applied to positions 6:9 of the kept columns
+risk_labels <- c("No Risk", "Low", "Medium", "High")
+```
+
+# A–C/ Combine all the scenarios into one dataframe, per habitat
+
+HRA produced one risk summary CSV per habitat per year (2016, 2020, 2025). For each habitat, read the three yearly CSVs, and for each unit (km2 and percent) label the four risk-class columns with human-readable names, tag each row with its scenario year, reshape the wide table into long format (one row per planning unit and risk class), then combine the three years and export a single "by scenario" CSV. This is repeated for corals, seagrass, and mangroves, and within each for km2 and percent; both repetitions are handled by the loops below.
+
+```{r Combine yearly risk summaries into by-scenario CSVs for each habitat and unit}
+for (habitat in habitats) {
+
+  # Read the per-year wide risk-summary CSVs for this habitat
+  yearly_wide <- lapply(years, function(year) {
+    read.csv(file.path(habitats_dir, year, paste0("risk_summary_", habitat, ".csv")))
+  })
+  names(yearly_wide) <- years
+
+  for (unit in names(units)) {
+    keep_cols <- units[[unit]]
+
+    melted_years <- lapply(years, function(year) {
+      wide <- yearly_wide[[year]][, keep_cols]        # keep this unit's column block
+      names(wide)[6:9] <- risk_labels                 # label the four risk-class columns
+      wide$Year <- year                               # tag with scenario year
+      long <- melt(wide, id = id_cols)                # wide -> long
+      names(long)[names(long) == "variable"] <- "Risk"
+      names(long)[names(long) == "value"]    <- unit
+      long
+    })
+
+    risk_all <- do.call(rbind, melted_years)          # combine the three years
+
+    write.csv(risk_all,
+              file.path(habitats_dir,
+                        paste0("risk_", unit, "_by_scenario_", habitat, ".csv")),
+              row.names = FALSE)
+  }
+}
+```
+
+# D/ Create dataframes at Belize scale
+
+Subset each by-scenario file to the country-wide row (cpu == 10) and export a `_bz` version, for every habitat and unit.
+
+```{r Subset by-scenario results to the Belize scale for each habitat and unit}
+for (habitat in c("corals", "seagrass", "mangroves")) {
+  for (unit in c("km2", "pct")) {
+
+    f <- paste0("risk_", unit, "_by_scenario_", habitat, ".csv")
+    risk_df <- read.csv(file.path(habitats_dir, f))
+
+    # cpu 10 is the whole-country (Belize) planning unit
+    risk_df$cpu <- as.factor(risk_df$cpu)
+    bz_df <- risk_df[risk_df$cpu %in% c("10"), ]
+
+    write.csv(bz_df,
+              file.path(habitats_dir,
+                        paste0("risk_", unit, "_by_scenario_", habitat, "_bz.csv")),
+              row.names = FALSE)
+  }
+}
+```
+
+# E/ Create dataframes at CPUs scale
+
+Subset each by-scenario file to the individual planning units (cpu 1–9), add a combined `CPU` label, reorder so `CPU` sits after `cpu_name`, and export a `_cpu` version, for every habitat and unit.
+
+```{r Subset by-scenario results to the CPU scale for each habitat and unit}
+for (habitat in c("corals", "seagrass", "mangroves")) {
+  for (unit in c("km2", "pct")) {
+
+    f <- paste0("risk_", unit, "_by_scenario_", habitat, ".csv")
+    risk_df <- read.csv(file.path(habitats_dir, f))
+
+    # cpu 1-9 are the individual CPUs
+    risk_df$cpu <- as.factor(risk_df$cpu)
+    cpu_df <- risk_df[risk_df$cpu %in% c("1","2","3","4","5","6","7","8","9"), ]
+
+    # Combined label, e.g. "1-Northern Region"
+    cpu_df$CPU <- paste(cpu_df$cpu, cpu_df$cpu_name, sep = "-")
+
+    # Reorder: insert CPU (added as column 8) directly after cpu_name
+    # Result: cpu, cpu_name, CPU, cpu_nameo, habitat, Year, Risk, km2/pct
+    cpu_df <- cpu_df[, c(1:2, 8, 3:7)]
+
+    write.csv(cpu_df,
+              file.path(habitats_dir,
+                        paste0("risk_", unit, "_by_scenario_", habitat, "_cpu.csv")),
+              row.names = FALSE)
+  }
+}
+```
+
+We completed this section so we can clear our working environment.
+
+```{r Clear the working environment}
+rm(list = ls(all.names = TRUE))
+```
+
+# F/ Calculate functional habitat at the Belize scale
+
+We calculate the functional habitat for the entire country, for each habitat type. Each risk class is weighted before summing: areas at No Risk and Low risk count fully, Medium risk counts at half, and High risk counts as zero. These weights are the same across all three habitats.
+
+We set the working directory root and the shared parameters for this section.
+
+```{r Set the working directory and functional habitat parameters}
+wd_root <- "G:/Shared drives/GreenFin Belize/Science"
+habitats_dir <- file.path(wd_root, "01_hra_model/5_hra_outputs/2016_habitats")
+
+func_weights <- c("No Risk" = 1, "Low" = 1, "Medium" = 0.5, "High" = 0)
+habitat_labels <- c(corals = "Corals", seagrass = "Seagrasses", mangroves = "Mangroves")
+```
+
+For each habitat we read the Belize-scale risk summary, keep only the four weighted risk classes (this drops the cpu_km2 row), weight each area by its risk class, and sum per year and CPU. We write one functional-habitat file per habitat and keep each result to combine afterwards.
+
+```{r Calculate functional habitat per habitat at the Belize scale}
+functional_bz <- list()
+
+for (habitat in c("corals", "seagrass", "mangroves")) {
+  f <- paste0("risk_km2_by_scenario_", habitat, "_bz.csv")
+  habitat_risk <- read.csv(file.path(habitats_dir, f))
+
+  habitat_risk <- habitat_risk[habitat_risk$Risk %in% names(func_weights), ]
+
+  habitat_risk$func_hab <- habitat_risk$km2 * func_weights[habitat_risk$Risk]
+  functional_hab_sum <- habitat_risk %>%
+    group_by(Year, cpu) %>%
+    summarise(km2 = sum(func_hab), .groups = "drop")
+
+  write.csv(functional_hab_sum,
+            file.path(habitats_dir,
+                      paste0("functional_habitat_km2_by_scenario_", habitat, "_bz.csv")),
+            row.names = FALSE)
+
+  functional_hab_sum$Habitat <- habitat_labels[[habitat]]
+  functional_bz[[habitat]] <- functional_hab_sum
+}
+```
+
+Last we combine the functional habitat for the three habitats into one database to create a barchart (refer to HRA_figure script). We reorder the columns to Habitat, Year, km2.
+
+```{r Combine the functional habitat for the 3 habitats into 1 database}
+functional_hab_sum_bz <- do.call(rbind, functional_bz)
+functional_hab_sum_bz <- functional_hab_sum_bz[, c("Habitat", "Year", "km2")]
+
+write.csv(functional_hab_sum_bz,
+          file.path(habitats_dir, "functional_habitat_km2_by_scenario_bz.csv"),
+          row.names = FALSE)
+```
+
+# G/ Calculate functional habitat at the CPU scale
+
+We calculate the functional habitat by CPU, for each habitat type. As at the Belize scale, each risk class is weighted before summing: areas at No Risk and Low risk count fully, Medium risk counts at half, and High risk counts as zero. These weights are the same across all three habitats.
+
+We set the working directory root and the shared parameters for this section.
+
+```{r Set the working directory and functional habitat parameters (CPU scale)}
+wd_root <- "G:/Shared drives/GreenFin Belize/Science"
+habitats_dir <- file.path(wd_root, "01_hra_model/5_hra_outputs/2016_habitats")
+
+func_weights <- c("No Risk" = 1, "Low" = 1, "Medium" = 0.5, "High" = 0)
+habitat_labels <- c(corals = "Corals", seagrass = "Seagrasses", mangroves = "Mangroves")
+```
+
+For each habitat we read the CPU risk summary, keep only the four weighted risk classes (this drops the cpu_km2 row), weight each area by its risk class, and sum per year and planning unit (retaining the CPU label and name). We write one functional-habitat file per habitat and keep each result to combine afterwards.
+
+```{r Calculate functional habitat per habitat at the CPU scale}
+functional_cpu <- list()
+
+for (habitat in c("corals", "seagrass", "mangroves")) {
+  f <- paste0("risk_km2_by_scenario_", habitat, "_cpu.csv")
+  habitat_risk <- read.csv(file.path(habitats_dir, f))
+
+  habitat_risk <- habitat_risk[habitat_risk$Risk %in% names(func_weights), ]
+
+  habitat_risk$func_hab <- habitat_risk$km2 * func_weights[habitat_risk$Risk]
+  functional_hab_sum <- habitat_risk %>%
+    group_by(Year, cpu, CPU, cpu_name) %>%
+    summarise(km2 = sum(func_hab), .groups = "drop")
+
+  write.csv(functional_hab_sum,
+            file.path(habitats_dir,
+                      paste0("functional_habitat_km2_by_scenario_", habitat, "_cpu.csv")),
+            row.names = FALSE)
+
+  functional_hab_sum$Habitat <- habitat_labels[[habitat]]
+  functional_cpu[[habitat]] <- functional_hab_sum
+}
+```
+
+Last we combine the functional habitat for the three habitats into one database to create a barchart (refer to HRA_figure script). We reorder the columns so Habitat comes first.
+
+```{r Combine the functional habitat for the 3 habitats into 1 database (CPU scale)}
+functional_hab_sum_cpu <- do.call(rbind, functional_cpu)
+functional_hab_sum_cpu <- functional_hab_sum_cpu[, c("Habitat", "Year", "cpu", "CPU", "cpu_name", "km2")]
+
+write.csv(functional_hab_sum_cpu,
+          file.path(habitats_dir, "functional_habitat_km2_by_scenario_cpu.csv"),
+          row.names = FALSE)
+```
+
+# H/ Summarize the habitat risk results into bar charts
+
+## Belize scale
+
+For each habitat we read the Belize-scale risk summary, drop the cpu_km2 rows, order the year and risk factors, and draw a faceted bar chart of area by risk level, one facet per scenario year. Each chart is written to its own PDF.
+
+```{r Set the parameters for the Belize scale risk bar charts}
+wd_root <- "G:/Shared drives/GreenFin Belize/Science"
+habitats_dir <- file.path(wd_root, "01_hra_model/5_hra_outputs/2016_habitats")
+
+# Colors for the four risk levels
+riskycols <- c("No Risk" = "grey", "Low" = "#0066CC", "Medium" = "#FFCC00", "High" = "red3")
+
+# Each habitat maps to its chart title and its figure-number filename prefix
+bz_charts <- list(
+  corals    = list(title = "Coral Habitat",     fig = "Fig_1"),
+  seagrass  = list(title = "Seagrass Habitat",  fig = "Fig_2"),
+  mangroves = list(title = "Mangroves Habitat", fig = "Fig_3")
+)
+```
+
+
+```{r Draw the Belize scale risk bar charts for each habitat}
+for (habitat in names(bz_charts)) {
+  title <- bz_charts[[habitat]]$title
+  fig   <- bz_charts[[habitat]]$fig
+
+  hab_risk <- read.csv(file.path(habitats_dir,
+                                 paste0("risk_km2_by_scenario_", habitat, "_bz.csv")))
+
+  # Drop the cpu_km2 rows, keeping only the four real risk classes
+  hab_risk <- hab_risk[hab_risk$Risk != "cpu_km2", ]
+
+  # Order the year and risk factors for consistent plotting
+  hab_risk$Year <- factor(hab_risk$Year, levels = c("2016", "2020", "2025"))
+  hab_risk$Risk <- factor(hab_risk$Risk, levels = c("No Risk", "Low", "Medium", "High"))
+
+  ggbars <- ggplot(hab_risk) +
+    geom_bar(aes(x = Risk, y = km2, fill = Risk), position = "dodge", stat = "identity") +
+    scale_fill_manual(values = riskycols) +
+    labs(title = title, x = "", y = bquote("Area " (km^2)), fill = "Risk Level:") +
+    facet_wrap("Year") +
+    theme_bw() +
+    theme(axis.title.x = element_blank(),
+          axis.ticks.x = element_blank(),
+          axis.text.x  = element_blank(),
+          axis.title.y = element_text(size = 12, face = "bold"),
+          axis.text    = element_text(size = 12, color = "black"),
+          strip.text.x = element_text(size = 12),
+          legend.title = element_text(color = "black", size = 12, face = "bold"),
+          legend.text  = element_text(color = "black", size = 12),
+          legend.position = "bottom")
+
+  pdf(file.path(habitats_dir, paste0(fig, "_barplot_bz_hab_risk_", habitat, ".pdf")),
+      width = 6, height = 5)
+  print(plot_grid(ggbars + scale_y_continuous(labels = scales::comma)))
+  dev.off()
+}
+```
+
+## CPU scale — combined charts
+
+For each habitat we read the CPU risk summary, drop the cpu_km2 rows, and order the year, risk, and CPU factors. The risk levels are ordered from High to No Risk and the CPUs are reversed, so that after the horizontal flip the highest risk and the first CPU appear in the intended positions. We then draw a horizontal faceted bar chart of area by CPU and risk level, one facet per scenario year, and write each habitat's chart to its own PDF.
+
+We set the working directory root and the shared parameters for these charts.
+
+```{r Set the parameters for the combined CPU scale risk bar charts}
+wd_root <- "G:/Shared drives/GreenFin Belize/Science"
+habitats_dir <- file.path(wd_root, "01_hra_model/5_hra_outputs/2016_habitats")
+
+# Colors for the four risk levels
+riskycols <- c("No Risk" = "grey", "Low" = "#0066CC", "Medium" = "#FFCC00", "High" = "red3")
+
+# CPU factor order (reversed, so the first CPU appears at the top after coord_flip)
+cpu_levels <- c("9-Southern Region", "8-South Central Region", "7-South Northern Region",
+                "6-Lighthouse Reef Atoll", "5-Turneffe Atoll", "4-Central Region",
+                "3-Caye Caulker", "2-Ambergris Caye", "1-Northern Region")
+
+# Each habitat maps to its chart title and figure-number filename prefix
+cpu_charts <- list(
+  corals    = list(title = "Coral Habitat",     fig = "Fig_4"),
+  seagrass  = list(title = "Seagrass Habitat",  fig = "Fig_5"),
+  mangroves = list(title = "Mangroves Habitat", fig = "Fig_6")
+)
+```
+
+We loop over the three habitats, building and saving one combined chart each.
+
+```{r Draw the combined CPU scale risk bar charts for each habitat}
+for (habitat in names(cpu_charts)) {
+  title <- cpu_charts[[habitat]]$title
+  fig   <- cpu_charts[[habitat]]$fig
+
+  # Read this habitat's CPU risk summary
+  hab_risk <- read.csv(file.path(habitats_dir,
+                                 paste0("risk_km2_by_scenario_", habitat, "_cpu.csv")))
+
+  # Drop the cpu_km2 rows, keeping only the four real risk classes
+  hab_risk <- hab_risk[hab_risk$Risk != "cpu_km2", ]
+
+  # Order the factors (Risk reversed; CPU reversed for coord_flip)
+  hab_risk$Year <- factor(hab_risk$Year, levels = c("2016", "2020", "2025"))
+  hab_risk$Risk <- factor(hab_risk$Risk, levels = c("High", "Medium", "Low", "No Risk"))
+  hab_risk$CPU  <- factor(hab_risk$CPU,  levels = cpu_levels)
+
+  # Build the horizontal faceted bar chart (one facet per year)
+  ggbars <- ggplot(hab_risk) +
+    geom_bar(aes(x = CPU, y = km2, fill = Risk), position = "dodge", stat = "identity") +
+    scale_fill_manual(values = riskycols) +
+    labs(title = title, x = "Coastal Planning Units", y = bquote("Area " (km^2)), fill = "Risk:") +
+    facet_wrap("Year") +
+    theme_bw() +
+    theme(axis.title.x = element_text(size = 12, face = "bold"),
+          axis.title.y = element_text(size = 12, face = "bold"),
+          axis.text    = element_text(size = 12, color = "black"),
+          strip.text.x = element_text(size = 12),
+          legend.title = element_text(color = "black", size = 12, face = "bold"),
+          legend.text  = element_text(color = "black", size = 12),
+          legend.position = "bottom")
+
+  # Write this habitat's chart to its own PDF
+  pdf(file.path(habitats_dir, paste0(fig, "_barplot_cpu_hab_risk_", habitat, ".pdf")),
+      width = 8, height = 5)
+  print(plot_grid(ggbars + coord_flip() + scale_y_continuous(labels = scales::comma)))
+  dev.off()
+}
+```
+
+
+## CPU scale — individual CPU charts
+
+We also produce one chart per individual CPU, for each habitat: 3 habitats × 9 planning units = 27 charts. Each is the same horizontal faceted bar chart as the combined version, but filtered to a single planning unit. They differ only by habitat (title and filename), planning unit (row filter, CPU label, and filename suffix), and use a shorter page height. Note the mangrove charts use the singular title "Mangrove Habitat".
+
+We set the working directory root and the shared parameters for these charts.
+
+```{r Set the parameters for the individual CPU scale risk bar charts}
+wd_root <- "G:/Shared drives/GreenFin Belize/Science"
+habitats_dir <- file.path(wd_root, "01_hra_model/5_hra_outputs/2016_habitats")
+
+# Colors for the four risk levels
+riskycols <- c("No Risk" = "grey", "Low" = "#0066CC", "Medium" = "#FFCC00", "High" = "red3")
+
+# Each cpu number maps to its full CPU label
+cpu_labels <- c("1" = "1-Northern Region",
+                "2" = "2-Ambergris Caye",
+                "3" = "3-Caye Caulker",
+                "4" = "4-Central Region",
+                "5" = "5-Turneffe Atoll",
+                "6" = "6-Lighthouse Reef Atoll",
+                "7" = "7-South Northern Region",
+                "8" = "8-South Central Region",
+                "9" = "9-Southern Region")
+
+# Each habitat maps to its per-CPU chart title and figure-number filename prefix
+# (mangroves uses the singular "Mangrove Habitat" for the individual CPU charts)
+cpu_indiv_charts <- list(
+  corals    = list(title = "Coral Habitat",    fig = "Fig_4"),
+  seagrass  = list(title = "Seagrass Habitat", fig = "Fig_5"),
+  mangroves = list(title = "Mangrove Habitat", fig = "Fig_6")
+)
+```
+
+We loop over each habitat and each planning unit, building and saving one chart per combination.
+
+```{r Draw the individual CPU scale risk bar charts for each habitat and planning unit}
+for (habitat in names(cpu_indiv_charts)) {
+  title <- cpu_indiv_charts[[habitat]]$title
+  fig   <- cpu_indiv_charts[[habitat]]$fig
+
+  # Read this habitat's CPU risk summary once
+  hab_all <- read.csv(file.path(habitats_dir,
+                                paste0("risk_km2_by_scenario_", habitat, "_cpu.csv")))
+
+  # Drop the cpu_km2 rows, keeping only the four real risk classes
+  hab_all <- hab_all[hab_all$Risk != "cpu_km2", ]
+
+  for (cpu_num in names(cpu_labels)) {
+
+    # Subset to this single planning unit
+    hab_risk <- hab_all[hab_all$cpu == as.integer(cpu_num), ]
+
+    # Order the factors (Risk reversed; single CPU level for this planning unit)
+    hab_risk$Year <- factor(hab_risk$Year, levels = c("2016", "2020", "2025"))
+    hab_risk$Risk <- factor(hab_risk$Risk, levels = c("High", "Medium", "Low", "No Risk"))
+    hab_risk$CPU  <- factor(hab_risk$CPU,  levels = cpu_labels[[cpu_num]])
+
+    # Build the horizontal faceted bar chart (one facet per year)
+    ggbars <- ggplot(hab_risk) +
+      geom_bar(aes(x = CPU, y = km2, fill = Risk), position = "dodge", stat = "identity") +
+      scale_fill_manual(values = riskycols) +
+      labs(title = title, x = "Coastal Planning Unit", y = bquote("Area " (km^2)), fill = "Risk:") +
+      facet_wrap("Year") +
+      theme_bw() +
+      theme(axis.title.x = element_text(size = 12, face = "bold"),
+            axis.title.y = element_text(size = 12, face = "bold"),
+            axis.text    = element_text(size = 12, color = "black"),
+            strip.text.x = element_text(size = 12),
+            legend.title = element_text(color = "black", size = 12, face = "bold"),
+            legend.text  = element_text(color = "black", size = 12),
+            legend.position = "bottom")
+
+    # Write this habitat/planning-unit chart to its own PDF (e.g. Fig_4_..._corals_1.pdf)
+    pdf(file.path(habitats_dir,
+                  paste0(fig, "_barplot_cpu_hab_risk_", habitat, "_", cpu_num, ".pdf")),
+        width = 8.5, height = 2.5)
+    print(plot_grid(ggbars + coord_flip() + scale_y_continuous(labels = scales::comma)))
+    dev.off()
+  }
+}
+```
+
+We completed this section so we can clear our working environment.
+```{r Clear the working environment}
+rm(list = ls(all.names = TRUE))
+```
+
+# I/ Summarize the functional habitat results into bar charts
+
+We summarize the functional habitat into two bar charts: one at the Belize scale and one at the CPU scale. Unlike the risk charts, these are colored by habitat type. The Belize-scale chart also prints the rounded area value above each bar.
+
+We set the working directory root and the shared parameters for these charts.
+
+```{r Set the parameters for the functional habitat bar charts}
+wd_root <- "G:/Shared drives/GreenFin Belize/Science"
+habitats_dir <- file.path(wd_root, "01_hra_model/5_hra_outputs/2016_habitats")
+
+# Colors for the three habitats
+habcols <- c("Corals" = "coral", "Mangroves" = "black", "Seagrasses" = "darkgreen")
+
+# CPU factor order (reversed, so the first CPU appears at the top after coord_flip)
+cpu_levels <- c("9-Southern Region", "8-South Central Region", "7-South Northern Region",
+                "6-Lighthouse Reef Atoll", "5-Turneffe Atoll", "4-Central Region",
+                "3-Caye Caulker", "2-Ambergris Caye", "1-Northern Region")
+```
+
+At the Belize scale, we read the combined functional-habitat summary, order the habitat and year factors, round the area to whole km2, and draw a faceted bar chart of functional habitat by habitat type, one facet per year, with the value printed above each bar.
+
+```{r Draw the Belize scale functional habitat bar chart}
+hab_functional <- read.csv(file.path(habitats_dir,
+                                     "functional_habitat_km2_by_scenario_bz.csv"))
+
+# Order the habitat and year factors
+hab_functional$Habitat <- factor(hab_functional$Habitat,
+                                 levels = c("Corals", "Mangroves", "Seagrasses"))
+hab_functional$Year <- factor(hab_functional$Year, levels = c("2016", "2020", "2025"))
+
+# Round the area to whole km2 (used both for the bar height and the printed label)
+hab_functional$km2 <- round(hab_functional$km2)
+
+ggbars <- ggplot(hab_functional) +
+  geom_bar(aes(x = Habitat, y = km2, fill = Habitat), position = "dodge", stat = "identity") +
+  scale_fill_manual(values = habcols) +
+  labs(title = "Functional Habitat", x = "", y = bquote("Area " (km^2)), fill = "Habitats:") +
+  facet_wrap("Year") +
+  geom_text(data = hab_functional, aes(x = Habitat, y = km2, label = km2),
+            position = position_dodge(width = 0.9), vjust = -0.15) +
+  theme_bw() +
+  theme(axis.title.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.x  = element_blank(),
+        axis.title.y = element_text(size = 12, face = "bold"),
+        axis.text.y  = element_text(size = 12, color = "black"),
+        strip.text.x = element_text(size = 12),
+        legend.title = element_text(color = "black", size = 12, face = "bold"),
+        legend.text  = element_text(color = "black", size = 12),
+        legend.position = "bottom")
+
+pdf(file.path(habitats_dir, "Fig_7_barplot_bz_hab_functional.pdf"),
+    width = 5, height = 4.5)
+print(plot_grid(ggbars + scale_y_continuous(labels = scales::comma)))
+dev.off()
+```
+
+At the CPU scale, we read the combined functional-habitat summary, order the habitat, year, and CPU factors, and draw a horizontal faceted bar chart of functional habitat by CPU and habitat type, one facet per year.
+
+```{r Draw the CPU scale functional habitat bar chart}
+hab_functional <- read.csv(file.path(habitats_dir,
+                                     "functional_habitat_km2_by_scenario_cpu.csv"))
+
+# Order the habitat, year, and CPU factors
+hab_functional$Habitat <- factor(hab_functional$Habitat,
+                                 levels = c("Corals", "Mangroves", "Seagrasses"))
+hab_functional$Year <- factor(hab_functional$Year, levels = c("2016", "2020", "2025"))
+hab_functional$CPU  <- factor(hab_functional$CPU,  levels = cpu_levels)
+
+ggbars <- ggplot(hab_functional) +
+  geom_bar(aes(x = CPU, y = km2, fill = Habitat), position = "dodge", stat = "identity") +
+  scale_fill_manual(values = habcols) +
+  labs(title = "Functional Habitat", x = "Coastal Planning Units", y = bquote("Area " (km^2)), fill = "Habitats:") +
+  facet_wrap("Year") +
+  theme_bw() +
+  theme(axis.title.x = element_text(size = 12, face = "bold"),
+        axis.title.y = element_text(size = 12, face = "bold"),
+        axis.text    = element_text(size = 12, color = "black"),
+        strip.text.x = element_text(size = 12),
+        legend.title = element_text(color = "black", size = 12, face = "bold"),
+        legend.text  = element_text(color = "black", size = 12),
+        legend.position = "bottom")
+
+pdf(file.path(habitats_dir, "Fig_8_barplot_cpu_hab_functional.pdf"),
+    width = 8, height = 5)
+print(plot_grid(ggbars + coord_flip() + scale_y_continuous(labels = scales::comma)))
+dev.off()
+```
+
+

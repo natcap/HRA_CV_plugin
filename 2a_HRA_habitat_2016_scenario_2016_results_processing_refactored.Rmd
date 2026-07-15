@@ -24,7 +24,7 @@ library(tigris)
 library(reshape)
 ```
 
-Note: The working directory (WD) needs to reflect your local machine. Set the single root path below to point at your local copy of the "Science" folder; every input and output path in this script is built from it, so there is only one line to change.
+Note: The working directory needs to reflect your local machine. Set the single root path below to point at your local copy of the "Science" folder; every input and output path in this script is built from it, so there is only one line to change.
 
 ```{r Set the root working directory and shared parameters}
 # Root of the working directory: change this one line to match your local machine
@@ -36,7 +36,7 @@ hra_outputs_dir <- file.path(wd_root, "01_hra_model/5_hra_outputs/2016_habitats/
 # Folder where the split rasters and risk summaries will be written (outputs)
 summary_dir <- file.path(wd_root, "01_hra_model/5_hra_outputs/2016_habitats/2016")
 
-# Folder holding the coastal-planning-unit habitat shapefiles (inputs)
+# Folder holding the CPU habitat shapefiles (inputs)
 base_dir <- file.path(wd_root, "01_hra_model/_base")
 
 # The three habitats processed identically in this script
@@ -86,13 +86,13 @@ for (habitat in habitats) {
 }
 ```
 
-# B/ Habitat 2016 - Stressors 2016: Calculate the habitat area under each risk class per planning unit
+# B/ Habitat 2016 - Stressors 2016: Calculate the habitat area under each risk class per coastal planning unit (CPU)
 
 Note that to calculate the habitat area we need to multiply the raster values by 0.25 because: 1) we sum the grid cells from HRA at 500m x 500m = 250,000 m2 and 2) we want to convert those values to km2. This factor is stored above as `cell_area_km2`.
 
 For each habitat we: import the coral/seagrass/mangrove shapefile subdivided by coastal planning units (CPUs), run zonal statistics to get the area (km2) under each risk class per CPU, convert those areas to a percentage of the CPU area, and export the result as both a shapefile and a CSV. All of this is identical across habitats, so it runs inside a single loop.
 
-```{r Summarize risk area per planning unit and export for each habitat}
+```{r Summarize risk area per CPU and export for each habitat}
 # Iterate over each habitat (corals, seagrass, mangroves)
 for (habitat in habitats) {
 
@@ -100,9 +100,8 @@ for (habitat in habitats) {
   habitat_cpu <- st_read(file.path(base_dir,
                                    paste0("cpu_", habitat, "_2016.shp")))
 
-  # --- Pass 1: area (km2) under each risk class per CPU ---
-  # All four km2 columns are added first, so column order matches the original
-  # (grouped: all km2 columns, then all pct columns).
+  # area (km2) under each risk class per CPU
+  # All four km2 columns are added first (grouped: all km2 columns, then all pct columns)
   for (risk_label in names(risk_classes)) {
     risk_layer <- raster(file.path(summary_dir,
                                    paste0("risk_", risk_label, "_", habitat, ".tif")))
@@ -111,8 +110,8 @@ for (habitat in habitats) {
     habitat_cpu[[km2_col]] <- round(habitat_cpu[[km2_col]] * cell_area_km2, digits = 1)
   }
 
-  # --- Pass 2: percent of CPU area under each risk class ---
-  # Added after all km2 columns, reproducing the original grouped column order.
+  # % of CPU area under each risk class
+  # Added after all km2 columns
   for (risk_label in names(risk_classes)) {
     km2_col <- paste0(risk_label, "_km2")
     pct_col <- paste0(risk_label, "_pct")
@@ -120,7 +119,7 @@ for (habitat in habitats) {
                                     digits = 1)
   }
 
-  # --- Export the shapefile and a CSV table ---
+  # Export the shapefile and a CSV table
   habitat_sp <- as(habitat_cpu, "Spatial")
   print(class(habitat_sp))
   habitat_sf <- st_as_sf(habitat_sp)
